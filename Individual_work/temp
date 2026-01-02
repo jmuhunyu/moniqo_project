@@ -1,0 +1,99 @@
+# =========================
+# HistGradientBoosting + your preprocess (dense output) + VAL threshold tuning + TEST
+# =========================
+
+import numpy as np
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score, classification_report, precision_recall_curve
+
+# -------------------------
+# 0) Build/ensure preprocess outputs DENSE (required by HistGradientBoosting)
+# -------------------------
+cat_cols = X_train.select_dtypes(include=["object", "category"]).columns
+num_cols = X_train.columns.difference(cat_cols)
+
+# sklearn >= 1.2 uses sparse_output; fallback to sparse for older versions
+try:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+except TypeError:
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("cat", ohe, cat_cols),
+        ("num", "passthrough", num_cols),
+    ],
+    remainder="drop",
+    sparse_threshold=0.0,  # force dense even if something tries to be sparse
+)
+
+# -------------------------
+# 1) Define pipeline model
+# -------------------------
+gb_model = Pipeline(steps=[
+    ("prep", preprocess),
+    ("clf", HistGradientBoostingClassifier(
+        random_state=42,
+        max_iter=800,
+        learning_rate=0.03,
+        max_depth=None,
+        min_samples_leaf=30,
+        l2_regularization=1.0
+    ))
+])
+
+# -------------------------
+# 2) Fit (optionally with sample_weight for imbalance)
+# -------------------------
+# OPTIONAL imbalance handling (recommended if class 1 is rare)
+pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+sample_weight = np.where(y_train == 1, pos_weight, 1.0)
+
+gb_model.fit(X_train, y_train, clf__sample_weight=sample_weight)
+
+print("✅ Step 1 complete: Model trained on TRAIN set")
+
+# -------------------------
+# 3) Validation: ROC-AUC + threshold selection
+# -------------------------
+val_proba_gb = gb_model.predict_proba(X_val)[:, 1]
+print("\nGB VAL ROC–AUC:", roc_auc_score(y_val, val_proba_gb))
+
+precision, recall, thresholds = precision_recall_curve(y_val, val_proba_gb)
+
+pr_df_gb = pd.DataFrame({
+    "threshold": thresholds,
+    "precision": precision[:-1],
+    "recall": recall[:-1],
+})
+
+cand = (
+    pr_df_gb[(pr_df_gb["recall"] >= 0.65) & (pr_df_gb["recall"] <= 0.80)]
+    .sort_values("precision", ascending=False)
+)
+
+print("\nTop threshold candidates (VAL):")
+display(cand.head(10))
+
+CHOSEN_THRESHOLD_GB = float(cand.iloc[0]["threshold"]) if len(cand) else 0.5
+print("\nChosen GB threshold:", CHOSEN_THRESHOLD_GB)
+
+val_pred_gb = (val_proba_gb >= CHOSEN_THRESHOLD_GB).astype(int)
+print("\nGB VAL classification report (chosen threshold):")
+print(classification_report(y_val, val_pred_gb))
+
+# -------------------------
+# 4) Test: ROC-AUC + classification report using SAME threshold
+# -------------------------
+test_proba_gb = gb_model.predict_proba(X_test)[:, 1]
+print("\nGB TEST ROC–AUC:", roc_auc_score(y_test, test_proba_gb))
+
+test_pred_gb = (test_proba_gb >= CHOSEN_THRESHOLD_GB).astype(int)
+print("\nGB TEST classification report (chosen threshold from VAL):")
+print(classification_report(y_test, test_pred_gb))
+
